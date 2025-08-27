@@ -79,10 +79,12 @@ func main() {
 		rdb = redis.NewClusterClient(&redis.ClusterOptions{
 			Addrs:        addrs,
 			Password:     *password,
-			DialTimeout:  10 * time.Second,
-			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 30 * time.Second,
-			MaxRetries:   3,
+			DialTimeout:  30 * time.Second, // Increase from 10s
+			ReadTimeout:  60 * time.Second, // Increase from 30s
+			WriteTimeout: 60 * time.Second, // Increase from 30s
+			PoolSize:     50,               // Add pool size (default is 10 per node)
+			MinIdleConns: 10,               // Minimum idle connections
+			MaxRetries:   5,                // Increase retries
 			// Enable cluster discovery and redirection
 			ClusterSlots: func(ctx context.Context) ([]redis.ClusterSlot, error) {
 				// Use default cluster slot discovery
@@ -98,10 +100,12 @@ func main() {
 			Addr:         addrs[0],
 			Password:     *password,
 			DB:           *db,
-			DialTimeout:  10 * time.Second,
-			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 30 * time.Second,
-			MaxRetries:   3,
+			DialTimeout:  30 * time.Second,
+			ReadTimeout:  60 * time.Second,
+			WriteTimeout: 60 * time.Second,
+			PoolSize:     50, // Add pool size
+			MinIdleConns: 10,
+			MaxRetries:   5,
 		})
 	}
 
@@ -111,7 +115,7 @@ func main() {
 		log.Fatalf("Redis connection failed: %v", err)
 	}
 	fmt.Printf("Redis connection successful\n")
-	defer rdb.Close()
+	// defer rdb.Close()
 
 	if *export {
 		fmt.Printf("Starting data export, pattern: %s, output file: %s\n", *keyPattern, *output)
@@ -143,6 +147,10 @@ func main() {
 			log.Fatalf("Import failed: %v", err)
 		}
 		fmt.Printf("Data successfully imported from %s\n", importConfig.InputFile)
+	}
+	// Close client explicitly at the end
+	if err := rdb.Close(); err != nil {
+		log.Printf("Error closing Redis client: %v", err)
 	}
 }
 
@@ -329,7 +337,7 @@ func importData(rdb redis.UniversalClient, config ImportConfig, isCluster bool, 
 	decoder := json.NewDecoder(file)
 	var processed int
 	var failed int
-	var skipped int // New: skip count
+	var skipped int        // New: skip count
 	var batch []*RedisData // Accumulate batch
 
 	fmt.Printf("Starting data import...\n")
@@ -351,7 +359,7 @@ func importData(rdb redis.UniversalClient, config ImportConfig, isCluster bool, 
 			failed += f
 			skipped += s
 			batch = nil // Clear batch
-			if (processed + skipped) % 1000 == 0 {
+			if (processed+skipped)%1000 == 0 {
 				fmt.Printf("Processed %d keys (imported %d, skipped %d)...\n", processed+skipped, processed, skipped)
 			}
 		}
@@ -376,7 +384,7 @@ func importBatch(rdb redis.UniversalClient, batch []*RedisData, isCluster bool, 
 	var skipped int
 
 	// If skip-existing is enabled, first batch check existence and filter batch
-	if skipExisting {
+	if skipExisting && !isCluster {
 		existsMap := make(map[string]bool, len(batch))
 		cmds, err := rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 			for _, data := range batch {
@@ -402,6 +410,25 @@ func importBatch(rdb redis.UniversalClient, batch []*RedisData, isCluster bool, 
 			}
 			batch = newBatch // Update batch to only non-existing keys
 		}
+	} else if skipExisting && isCluster {
+		// 集群模式下逐个检查键是否存在
+		newBatch := make([]*RedisData, 0, len(batch))
+		for _, data := range batch {
+			exists, err := rdb.Exists(ctx, data.Key).Result()
+			if err != nil {
+				log.Printf("检查键存在性失败 %s: %v", data.Key, err)
+				// 出错时默认不跳过
+				newBatch = append(newBatch, data)
+				continue
+			}
+			if exists > 0 {
+				skipped++
+				fmt.Printf("跳过已存在的键: %s\n", data.Key)
+			} else {
+				newBatch = append(newBatch, data)
+			}
+		}
+		batch = newBatch
 	}
 
 	// Now process the filtered batch
